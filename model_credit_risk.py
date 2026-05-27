@@ -1,119 +1,135 @@
+# ── Imports ───────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, classification_report
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
-# ── Load clean data ───────────────────────────────────────────────
-df = pd.read_csv(r'application_train_clean.csv')
-
-# ── Encode categorical columns ────────────────────────────────────
-# Models can't read text — convert categories to numbers
-categorical_cols = df.select_dtypes(include=['object']).columns
-le = LabelEncoder()
-for col in categorical_cols:
-    df[col] = le.fit_transform(df[col].astype(str))
-
-# ── Split features and target ─────────────────────────────────────
-X = df.drop(['TARGET', 'SK_ID_CURR'], axis=1)
-y = df['TARGET']
-
-
-
-# ── Train/test split ──────────────────────────────────────────────
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-
-# ── Scale features ────────────────────────────────────────────────
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled  = scaler.transform(X_test)
-
-# ── Logistic Regression on scaled data ───────────────────────────
-print("Training Logistic Regression...")
-lr = LogisticRegression(
-    max_iter=2000,
-    class_weight='balanced',
-    solver='saga',        # faster solver for large datasets
-    random_state=42,
-    n_jobs=-1             # use all CPU cores
-)
-lr.fit(X_train_scaled, y_train)
-
-lr_probs = lr.predict_proba(X_test_scaled)[:, 1]
-lr_auc   = roc_auc_score(y_test, lr_probs)
-
+from sklearn.metrics import roc_auc_score
 from xgboost import XGBClassifier
+import joblib
 
-print("Training XGBoost...")
-xgb = XGBClassifier(
-    n_estimators=300,
-    max_depth=6,
-    learning_rate=0.05,
-    scale_pos_weight=9,    # handles 8% default rate imbalance
-    random_state=42,
-    eval_metric='auc',
-    verbosity=0,
-    n_jobs=-1
-)
+# ── 1. Load Data ──────────────────────────────────────────────────
+def load_data(path):
+    df = pd.read_csv(path)
+    print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+    return df
 
-xgb.fit(
-    X_train, y_train,      # XGBoost doesn't need scaled data
-    eval_set=[(X_test, y_test)],
-    verbose=100
-)
+# ── 2. Clean Data ─────────────────────────────────────────────────
+def clean_data(df):
+    # Build all missing flag columns at once — no fragmentation
+    missing_flags = pd.concat([
+        df[col].isnull().astype(int).rename(f'{col}_WAS_MISSING')
+        for col in high_missing
+    ], axis=1)
+    df = pd.concat([df, missing_flags], axis=1)
+    
+    # Fill numeric with median
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+    
+    # Fill categorical with mode
+    categorical_cols = df.select_dtypes(include=['object', 'str']).columns
+    for col in categorical_cols:
+        df[col] = df[col].fillna(df[col].mode()[0])
+    
+    # Fix DAYS_EMPLOYED sentinel
+    df['DAYS_EMPLOYED_ANOMALY'] = (df['DAYS_EMPLOYED'] == 365243).astype(int)
+    df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].replace(365243, np.nan)
+    df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].fillna(df['DAYS_EMPLOYED'].median())
+    
+    df = df.copy()
+    print(f"Cleaned: {df.isnull().sum().sum()} missing values remaining")
+    return df
 
-xgb_probs = xgb.predict_proba(X_test)[:, 1]
-xgb_auc   = roc_auc_score(y_test, xgb_probs)
+# ── 3. Engineer Features ──────────────────────────────────────────
+def engineer_features(df):
+    df['PAYMENT_BURDEN']    = df['AMT_ANNUITY'] / df['AMT_INCOME_TOTAL']
+    df['DEBT_TO_INCOME']    = df['AMT_CREDIT'] / df['AMT_INCOME_TOTAL']
+    df['INCOME_PER_PERSON'] = df['AMT_INCOME_TOTAL'] / df['CNT_FAM_MEMBERS']
+    df['LOAN_TO_GOODS']     = df['AMT_CREDIT'] / df['AMT_GOODS_PRICE']
+    df['EMPLOYMENT_RATIO']  = df['DAYS_EMPLOYED'] / df['DAYS_BIRTH']
+    df['AGE_YEARS']         = (df['DAYS_BIRTH'] / -365).astype(int)
+    
+    print(f"Features engineered: {df.shape[1]} total columns")
+    return df
 
-print(f"\nXGBoost AUC-ROC:  {xgb_auc:.4f}")
-print(f"Gini Coefficient: {(xgb_auc*2-1):.4f}")
-print(f"\nImprovement over Logistic Regression: +{(xgb_auc-lr_auc):.4f}")
+# ── 4. Prepare Model Input ────────────────────────────────────────
+def prepare_model_input(df):
+    # Encode categoricals
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    categorical_cols = df.select_dtypes(include=['object', 'str']).columns
+    for col in categorical_cols:
+        df[col] = le.fit_transform(df[col].astype(str))
+    
+    X = df.drop(['TARGET', 'SK_ID_CURR'], axis=1)
+    y = df['TARGET']
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"Train: {X_train.shape} | Test: {X_test.shape}")
+    return X_train, X_test, y_train, y_test
 
-import shap
+# ── 5. Train Models ───────────────────────────────────────────────
+def train_models(X_train, X_test, y_train, y_test):
+    # Scale for Logistic Regression
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+    
+    # Logistic Regression
+    print("Training Logistic Regression...")
+    lr = LogisticRegression(
+        max_iter=2000,
+        class_weight='balanced',
+        solver='saga',
+        random_state=42
+    )
+    lr.fit(X_train_scaled, y_train)
+    lr_auc = roc_auc_score(y_test, lr.predict_proba(X_test_scaled)[:, 1])
+    print(f"LR AUC: {lr_auc:.4f}")
+    
+    # XGBoost
+    print("Training XGBoost...")
+    xgb = XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        scale_pos_weight=9,
+        random_state=42,
+        eval_metric='auc',
+        verbosity=0
+    )
+    xgb.fit(X_train, y_train)
+    xgb_auc = roc_auc_score(y_test, xgb.predict_proba(X_test)[:, 1])
+    print(f"XGB AUC: {xgb_auc:.4f}")
+    print(f"Improvement: +{(xgb_auc - lr_auc):.4f}")
+    
+    return lr, xgb, scaler, lr_auc, xgb_auc
 
-print("Calculating SHAP values (this takes 2-3 minutes)...")
+# ── 6. Save Artifacts ─────────────────────────────────────────────
+def save_artifacts(xgb, scaler, X_train, path):
+    joblib.dump(xgb, f'{path}/xgb_model.pkl')
+    joblib.dump(scaler, f'{path}/scaler.pkl')
+    X_train.median().to_csv(f'{path}/feature_medians.csv')
+    pd.Series(X_train.columns.tolist()).to_csv(
+        f'{path}/feature_cols.csv', index=False
+    )
+    print("Artifacts saved.")
 
-# Build SHAP explainer on XGBoost model
-explainer = shap.TreeExplainer(xgb)
-shap_values = explainer.shap_values(X_test[:1000])  # sample 1000 rows
-
-# ── Plot 1: Top 20 most important features globally ───────────────
-shap.summary_plot(
-    shap_values,
-    X_test[:1000],
-    max_display=20,
-    show=False
-)
-import matplotlib.pyplot as plt
-plt.tight_layout()
-plt.savefig(r'D:\.Eslam\py projects\shap_summary.png', dpi=150)
-plt.close()
-print("SHAP summary plot saved.")
-
-# ── Top features in plain text ────────────────────────────────────
-feature_importance = pd.DataFrame({
-    'feature': X_test.columns,
-    'importance': abs(shap_values).mean(axis=0)
-}).sort_values('importance', ascending=False)
-
-print("\n=== TOP 15 FEATURES DRIVING DEFAULT PREDICTION ===")
-print(feature_importance.head(15).to_string(index=False))
-
-# Save model results summary
-results = {
-    'Logistic Regression AUC': round(lr_auc, 4),
-    'XGBoost AUC': round(xgb_auc, 4),
-    'Gini XGBoost': round(xgb_auc*2-1, 4),
-    'Top Feature': 'EXT_SOURCE_3',
-    'Best Engineered Feature': 'LOAN_TO_GOODS (rank 4/182)'
-}
-
-for k, v in results.items():
-    print(f"{k}: {v}")
-
+# ── MAIN ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    PATH = r'D:\.Eslam\py projects'
+    
+    df = load_data(f'{PATH}/application_train.csv')
+    df = clean_data(df)
+    df = engineer_features(df)
+    
+    X_train, X_test, y_train, y_test = prepare_model_input(df)
+    lr, xgb, scaler, lr_auc, xgb_auc = train_models(
+        X_train, X_test, y_train, y_test
+    )
+    
+    save_artifacts(xgb, scaler, X_train, PATH)
